@@ -18,6 +18,23 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Processing",
     "Topic :: Scientific/Engineering :: Physics",
 ]
+keywords = [
+    "modulation-transfer-function",
+    "mtf",
+    "iso12233",
+    "slanted-edge",
+    "computer-vision",
+    "physics-informed-neural-networks",
+    "pinn",
+    "deep-learning",
+    "pytorch",
+    "optical-inspection",
+    "lens-sharpness",
+    "image-processing",
+    "camera-calibration",
+    "edge-spread-function",
+    "line-spread-function",
+]
 dependencies = [
     "numpy>=1.24.0",
     "opencv-python>=4.8.0",

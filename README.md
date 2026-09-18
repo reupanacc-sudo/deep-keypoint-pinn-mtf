@@ -3,8 +3,16 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange.svg)](https://pytorch.org/)
+[![Topic: Computer Vision](https://img.shields.io/badge/Topic-Computer%20Vision-blueviolet.svg)](#)
+[![Topic: Physics-Informed Neural Network](https://img.shields.io/badge/Topic-PINN%20%26%20Fourier%20Optics-yellow.svg)](#)
+[![Standard: ISO 12233](https://img.shields.io/badge/Standard-ISO%2012233-critical.svg)](#)
 
-An open-source, high-speed deep learning optical quality inspection engine. Replaces legacy slanted-edge software with a **2D ResNet-Edge Convolutional Neural Network** for **sub-millisecond Edge-to-MTF regression** combined with a certified **ISO 12233 4-stage physics baseline (ESF → LSF → FFT → MTF)**.
+> **Sub-Millisecond 2D ResNet-Edge MTF Regression & ISO 12233 4-Stage Physics Optical Quality Inspection Engine in PyTorch.**
+
+---
+
+### 🏷️ Topics & Keywords
+`computer-vision` • `modulation-transfer-function` • `mtf` • `iso12233` • `slanted-edge` • `physics-informed-neural-networks` • `pinn` • `deep-learning` • `pytorch` • `optical-inspection` • `lens-sharpness` • `camera-calibration` • `fourier-optics` • `image-processing`
 
 ---
 
