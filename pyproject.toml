@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openmtf"
+version = "1.0.0"
+authors = [
+  { name="Reu Pan" },
+]
+description = "Dual-Engine MTF: Physics-Informed Neural Network (PINN) + Classical ISO 12233 with Subpixel 50/50 ROI Equalization"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "opencv-python>=4.8.0",
+    "torch>=2.0.0",
+    "matplotlib>=3.7.0",
+    "scipy>=1.10.0",
+    "onnxruntime>=1.16.0",
+    "Pillow>=9.5.0",
+]
+
+[project.scripts]
+openmtf-gui = "demo_dual_engine_gui:main"
