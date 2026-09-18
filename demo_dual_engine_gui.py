@@ -279,6 +279,7 @@ class ModernMTFApp(tk.Tk):
         self.current_image = img
         self.current_image_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
         self.selected_roi_crop = self.current_image_gray
+        self.selected_roi_rot = None
         self.detected_rois = []
         self.roi_listbox.delete(0, tk.END)
 
@@ -299,6 +300,7 @@ class ModernMTFApp(tk.Tk):
         self.current_image = roi
         self.current_image_gray = roi
         self.selected_roi_crop = roi
+        self.selected_roi_rot = None
         self.detected_rois = []
         self.roi_listbox.delete(0, tk.END)
         self._display_image_on_canvas(roi)
@@ -307,25 +309,57 @@ class ModernMTFApp(tk.Tk):
     def _on_auto_detect_edges(self):
         if self.current_image_gray is None:
             return
-        rois = self.engine.auto_detect_slanted_edges(self.current_image_gray, max_edges=8)
+        rois = self.engine.auto_detect_slanted_edges(self.current_image_gray, max_edges=12)
         self.detected_rois = rois
         self.roi_listbox.delete(0, tk.END)
-        for name, x1, y1, x2, y2 in rois:
-            self.roi_listbox.insert(tk.END, f"{name}: [{x1},{y1} to {x2},{y2}]")
+
+        self._draw_all_detected_boxes()
+
+        for item in rois:
+            name, x1, y1, x2, y2, rot, ang = item
+            self.roi_listbox.insert(tk.END, f"{name}: ({x1},{y1}) [{x2-x1}x{y2-y1}]")
 
         if rois:
             self.roi_listbox.selection_set(0)
             self._on_roi_selected(None)
+
+    def _draw_all_detected_boxes(self, selected_idx=0):
+        if not hasattr(self, "img_offset_x") or not self.detected_rois:
+            return
+        self.canvas.delete("roi_box")
+        self.canvas.delete("all_roi_boxes")
+
+        for idx, item in enumerate(self.detected_rois):
+            name, x1, y1, x2, y2, rot, ang = item
+            sx1 = self.img_offset_x + int(x1 * self.scale_factor)
+            sy1 = self.img_offset_y + int(y1 * self.scale_factor)
+            sx2 = self.img_offset_x + int(x2 * self.scale_factor)
+            sy2 = self.img_offset_y + int(y2 * self.scale_factor)
+
+            if idx == selected_idx:
+                outline_color = "#00e5ff"
+                box_w = 2
+                tag_name = "roi_box"
+            else:
+                outline_color = "#ffa657" if rot == 90 else "#58a6ff"
+                box_w = 1
+                tag_name = "all_roi_boxes"
+
+            self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline=outline_color, width=box_w, tags=tag_name)
+            self.canvas.create_text(sx1 + 4, max(12, sy1 - 8), text=f"E{idx+1}", fill=outline_color, font=("Segoe UI", 8, "bold"), tags=tag_name, anchor=tk.W)
 
     def _on_roi_selected(self, event):
         sel = self.roi_listbox.curselection()
         if not sel or not self.detected_rois:
             return
         idx = sel[0]
-        name, x1, y1, x2, y2 = self.detected_rois[idx]
+        item = self.detected_rois[idx]
+        name, x1, y1, x2, y2, rot, ang = item
+
         self.selected_roi_crop = self.current_image_gray[y1:y2, x1:x2]
-        self._draw_roi_rect(x1, y1, x2, y2)
-        self._on_run_inference()
+        self.selected_roi_rot = rot
+        self._draw_all_detected_boxes(selected_idx=idx)
+        self._on_run_inference(rotate_deg=rot)
 
     def _draw_roi_rect(self, x1, y1, x2, y2):
         if not hasattr(self, "img_offset_x"):
@@ -336,6 +370,7 @@ class ModernMTFApp(tk.Tk):
         sy2 = self.img_offset_y + int(y2 * self.scale_factor)
 
         self.canvas.delete("roi_box")
+        self.canvas.delete("all_roi_boxes")
         self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline="#00e5ff", width=2, tags="roi_box")
 
     def _on_canvas_press(self, event):
@@ -373,7 +408,7 @@ class ModernMTFApp(tk.Tk):
             self._draw_roi_rect(ix1, iy1, ix2, iy2)
             self._on_run_inference()
 
-    def _on_run_inference(self):
+    def _on_run_inference(self, rotate_deg=None):
         crop = self.selected_roi_crop if self.selected_roi_crop is not None else self.current_image_gray
         if crop is None or crop.size < 32:
             return
@@ -383,7 +418,15 @@ class ModernMTFApp(tk.Tk):
         except ValueError:
             target_f = 50.0
 
-        res = self.engine.analyze_roi_full(crop, target_freq_lpmm=target_f, pixel_size_mm=self.pixel_size_mm)
+        if rotate_deg is None and hasattr(self, "selected_roi_rot"):
+            rotate_deg = self.selected_roi_rot
+
+        res = self.engine.analyze_roi_full(
+            crop,
+            target_freq_lpmm=target_f,
+            pixel_size_mm=self.pixel_size_mm,
+            rotate_deg=rotate_deg
+        )
         self.current_results = res
         self._update_ui_with_results(res)
 

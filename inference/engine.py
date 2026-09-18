@@ -134,12 +134,14 @@ class ResNetEdgeMTFEngine:
         self,
         roi: np.ndarray,
         target_freq_lpmm: float = 50.0,
-        pixel_size_mm: float = 0.00375
+        pixel_size_mm: float = 0.00375,
+        rotate_deg: int = None
     ):
         """
         Performs full dual analysis on any slanted edge crop:
-        1. Sub-millisecond 2D ResNet-Edge neural regression
-        2. Classical ISO 12233 4-stage physics pipeline (ESF -> LSF -> FFT -> MTF)
+        1. Auto-detects edge orientation (Horizontal/Sagittal vs Vertical/Tangential) and normalizes
+        2. Sub-millisecond 2D ResNet-Edge neural regression
+        3. Classical ISO 12233 4-stage physics pipeline (ESF -> LSF -> FFT -> MTF)
         """
         if roi is None or roi.size < 64:
             return None
@@ -149,12 +151,31 @@ class ResNetEdgeMTFEngine:
         else:
             gray = roi.copy()
 
+        # Auto-detect orientation if not specified
+        if rotate_deg is None:
+            gy = np.mean(np.abs(cv2.Sobel(gray.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)))
+            gx = np.mean(np.abs(cv2.Sobel(gray.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)))
+            if gy > 1.25 * gx:
+                rotate_deg = 90
+            else:
+                rotate_deg = 0
+
+        # Rotate horizontal edges to vertical
+        if rotate_deg == 90:
+            gray_proc = cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
+        elif rotate_deg == 180:
+            gray_proc = cv2.rotate(gray, cv2.ROTATE_180)
+        elif rotate_deg == 270:
+            gray_proc = cv2.rotate(gray, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        else:
+            gray_proc = gray
+
         # 1. Neural ResNet-Edge Regression
-        neural_res = self.predict_neural_mtf(gray, target_freq_lpmm=target_freq_lpmm)
+        neural_res = self.predict_neural_mtf(gray_proc, target_freq_lpmm=target_freq_lpmm)
 
         # 2. Classical ISO 12233 Physics Decomposition
         classical_res = compute_slanted_edge_mtf(
-            gray,
+            gray_proc,
             target_freq_lpmm=target_freq_lpmm,
             pixel_size_mm=pixel_size_mm
         )
@@ -167,7 +188,9 @@ class ResNetEdgeMTFEngine:
             consensus_delta = round(abs(n_val - c_val) * 100.0, 2)
 
         return {
-            "gray_crop": gray,
+            "gray_crop": gray_proc,
+            "raw_crop": gray,
+            "rotate_deg": rotate_deg,
             "neural": neural_res,
             "classical": classical_res,
             "consensus_delta_percent": consensus_delta,
@@ -177,12 +200,12 @@ class ResNetEdgeMTFEngine:
     def auto_detect_slanted_edges(
         self,
         full_image: np.ndarray,
-        max_edges: int = 12,
+        max_edges: int = 16,
         roi_size: tuple = (50, 50)
     ):
         """
-        Universal slanted edge detector for ANY camera image.
-        Finds high-contrast edge patches with slant angles suitable for ISO 12233 analysis.
+        Universal high-precision slanted edge detector for ANY camera image.
+        Uses Canny + Probabilistic Hough Lines with slant-angle geometric filtering.
         """
         if full_image is None or full_image.size < 1000:
             return []
@@ -195,47 +218,96 @@ class ResNetEdgeMTFEngine:
         h, w = gray.shape
         rw, rh = roi_size
 
-        # Compute gradient magnitude
-        grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        mag = cv2.magnitude(grad_x, grad_y)
+        # 1. Multi-scale Canny edge detection
+        blurred = cv2.GaussianBlur(gray, (5, 5), 1.2)
+        edges = cv2.Canny(blurred, 35, 110)
 
-        # Non-maximum suppression grid search for edge candidates
-        step = max(rw, rh) // 2
+        # 2. Probabilistic Hough Line Transform
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=20, minLineLength=20, maxLineGap=8)
         candidates = []
 
-        for y in range(rh // 2, h - rh, step):
-            for x in range(rw // 2, w - rw, step):
-                patch_mag = mag[y:y+rh, x:x+rw]
-                avg_grad = float(np.mean(patch_mag))
-                std_grad = float(np.std(patch_mag))
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                length = math.hypot(x2 - x1, y2 - y1)
+                if length < 20:
+                    continue
 
-                # Check if region contains a strong edge with high variation
-                if avg_grad > 25.0 and std_grad > 15.0:
-                    candidates.append((avg_grad, (x, y, x + rw, y + rh)))
+                angle_rad = math.atan2(y2 - y1, x2 - x1)
+                angle_deg = math.degrees(angle_rad) % 180
 
-        # Sort candidates by gradient strength and pick top diverse locations
+                # Slant angle filtering:
+                # Vertical-ish edges (tilted 2°–25° from vertical 90°): 65°–88° or 92°–115°
+                # Horizontal-ish edges (tilted 2°–25° from horizontal 0°/180°): 2°–25° or 155°–178°
+                is_vert = (65 <= angle_deg <= 88) or (92 <= angle_deg <= 115)
+                is_horiz = (2 <= angle_deg <= 25) or (155 <= angle_deg <= 178)
+
+                if not (is_vert or is_horiz):
+                    continue
+
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
+
+                bx1 = max(0, cx - rw // 2)
+                by1 = max(0, cy - rh // 2)
+                bx2 = min(w, bx1 + rw)
+                by2 = min(h, by1 + rh)
+
+                if (bx2 - bx1) < rw or (by2 - by1) < rh:
+                    continue
+
+                patch = gray[by1:by2, bx1:bx2]
+                contrast = float(np.max(patch)) - float(np.min(patch))
+                if contrast < 30.0:
+                    continue
+
+                rot_deg = 90 if is_horiz else 0
+                score = contrast * length
+                candidates.append((score, (bx1, by1, bx2, by2), rot_deg, angle_deg, (cx, cy)))
+
+        # Fallback grid search if Hough lines found few candidates (e.g. out-of-focus or very blurry edges)
+        if len(candidates) < 4:
+            grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            mag = cv2.magnitude(grad_x, grad_y)
+            step = max(rw, rh)
+
+            for y in range(rh // 2, h - rh, step):
+                for x in range(rw // 2, w - rw, step):
+                    patch = gray[y:y+rh, x:x+rw]
+                    contrast = float(np.max(patch)) - float(np.min(patch))
+                    patch_mag = mag[y:y+rh, x:x+rw]
+                    avg_mag = float(np.mean(patch_mag))
+                    if contrast > 35.0 and avg_mag > 20.0:
+                        patch_gx = np.mean(np.abs(grad_x[y:y+rh, x:x+rw]))
+                        patch_gy = np.mean(np.abs(grad_y[y:y+rh, x:x+rw]))
+                        rot_deg = 90 if patch_gy > 1.25 * patch_gx else 0
+                        score = contrast * avg_mag
+                        candidates.append((score, (x, y, x + rw, y + rh), rot_deg, 0.0, (x + rw // 2, y + rh // 2)))
+
+        # Non-maximum suppression by spatial distance
         candidates.sort(key=lambda item: item[0], reverse=True)
-        selected_rois = []
-        min_dist_sq = (rw * 1.5) ** 2
+        selected = []
+        min_dist_sq = (rw * 1.4) ** 2
 
-        for _, (x1, y1, x2, y2) in candidates:
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
+        for score, (bx1, by1, bx2, by2), rot, ang, (cx, cy) in candidates:
             too_close = False
-            for _, sx1, sy1, sx2, sy2 in selected_rois:
-                scx = (sx1 + sx2) / 2.0
-                scy = (sy1 + sy2) / 2.0
-                if (cx - scx)**2 + (cy - scy)**2 < min_dist_sq:
+            for _, (sx1, sy1, sx2, sy2), _, _, (scx, scy) in selected:
+                if (cx - scx) ** 2 + (cy - scy) ** 2 < min_dist_sq:
                     too_close = True
                     break
             if not too_close:
-                name = f"ROI_{len(selected_rois) + 1}"
-                selected_rois.append((name, x1, y1, x2, y2))
-                if len(selected_rois) >= max_edges:
+                selected.append((score, (bx1, by1, bx2, by2), rot, ang, (cx, cy)))
+                if len(selected) >= max_edges:
                     break
 
-        return selected_rois
+        results = []
+        for i, (score, rect, rot, ang, center) in enumerate(selected):
+            orientation_str = "Sagittal (Horiz)" if rot == 90 else "Tangential (Vert)"
+            name = f"Edge_{i+1} [{orientation_str}]"
+            results.append((name, rect[0], rect[1], rect[2], rect[3], rot, ang))
+
+        return results
 
     def _compute_mtf50(self, freqs, mtf_curve):
         """Calculates MTF50 frequency via linear interpolation."""
