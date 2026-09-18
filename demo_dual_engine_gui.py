@@ -1,22 +1,17 @@
 """
-demo_dual_engine_gui.py - Modern Industrial GUI for Dual-Engine MTF
-Features:
-1. Visual Comparison: Static (Red) vs AI Dynamic 50/50 Luminance-Balanced ROI (Cyan)
-2. Detailed 4-Stage Physics Pipeline Breakdown:
-   - Panel 1: Normalized ESF (Edge Spread Function, 0.0 to 1.0)
-   - Panel 2: LSF (Line Spread Function with Hann/Hamming window)
-   - Panel 3: FFT Magnitude Spectrum
-   - Panel 4: Normalized MTF Curve (Strictly bounded in 0% to 100%)
-3. Neural PINN vs Classical ISO 12233 Real-Time Dual-Engine Consensus
+demo_dual_engine_gui.py - 2D ResNet-Edge Sub-Millisecond MTF Inspector
+A universal, open-source optical inspection desktop application.
+Allows users to load ANY camera image or edge crop and run instant 2D ResNet-Edge MTF regression.
 """
 
 import os
 import sys
-import threading
+import time
+import math
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import cv2
 import numpy as np
+import cv2
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -24,385 +19,484 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from PIL import Image, ImageTk
 
-# Base directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from dynamic_roi_engine import process_full_image_static_vs_dynamic
-from dual_overlay_visualizer import generate_dual_overlay_image
-from inference.dual_engine import DualEngineMTF
+from inference.engine import ResNetEdgeMTFEngine
+from training.synthetic_edge_generator import generate_slanted_edge
 
 
-class DualEngineApp(tk.Tk):
+class ModernMTFApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Deep Keypoint + PINN-MTF Dual Engine Inspector")
+        self.title("2D ResNet-Edge MTF Inspector | Sub-Millisecond Neural Optical Regression")
         self.geometry("1560x940")
-        self.configure(bg="#121417")
+        self.minsize(1280, 800)
+        self.configure(bg="#0f1115")
 
-        self.neural_engine = DualEngineMTF()
-        self.current_image_path = None
+        # Initialize Neural Engine
+        self.engine = ResNetEdgeMTFEngine()
+
+        # State
+        self.current_image = None
         self.current_image_gray = None
+        self.display_image = None
+        self.detected_rois = []
+        self.selected_roi_crop = None
         self.current_results = None
-        self.overlay_mode = "both"  # 'both', 'static', 'dynamic'
+        self.target_lpmm = 50.0
+        self.pixel_size_mm = 0.00375
+
+        # Drag selection state
+        self.drag_start = None
+        self.drag_rect_id = None
+        self.scale_factor = 1.0
 
         self._build_ui()
+        self._load_default_synthetic_sample()
 
     def _build_ui(self):
         # 1. Header Bar
-        header = tk.Frame(self, bg="#1a1d21", height=60)
+        header = tk.Frame(self, bg="#161920", height=60)
         header.pack(fill=tk.X, side=tk.TOP)
 
         title_lbl = tk.Label(
             header,
-            text="🎯 DEEP KEYPOINT + PINN-MTF DUAL-ENGINE INSPECTOR",
+            text="⚡ 2D ResNet-Edge MTF Inspector",
             font=("Segoe UI", 14, "bold"),
-            fg="#00ffff",
-            bg="#1a1d21"
+            fg="#00e5ff",
+            bg="#161920"
         )
         title_lbl.pack(side=tk.LEFT, padx=20, pady=12)
 
         subtitle_lbl = tk.Label(
             header,
-            text="Subpixel 50/50 Luminance Equalization & 4-Stage Physics Decomposition (ESF → LSF → FFT → MTF)",
+            text="Sub-Millisecond Edge-to-MTF Deep Convolutional Regression & 4-Stage Physics Decomposition",
             font=("Segoe UI", 10),
-            fg="#8a99a8",
-            bg="#1a1d21"
+            fg="#8c9ba5",
+            bg="#161920"
         )
         subtitle_lbl.pack(side=tk.LEFT, padx=5, pady=14)
 
-        # 2. Control Toolbar
-        toolbar = tk.Frame(self, bg="#21252b", height=50)
-        toolbar.pack(fill=tk.X, side=tk.TOP, padx=10, pady=5)
+        # 2. Top Toolbar
+        toolbar = tk.Frame(self, bg="#1c212a", height=50)
+        toolbar.pack(fill=tk.X, side=tk.TOP, padx=10, pady=6)
 
         btn_open = tk.Button(
             toolbar,
-            text="📁 Select Image",
+            text="📁 Open Image",
             font=("Segoe UI", 10, "bold"),
             bg="#0e639c",
             fg="white",
             relief=tk.FLAT,
-            padx=15,
+            padx=14,
             pady=5,
-            command=self._on_select_image
+            command=self._on_open_image
         )
-        btn_open.pack(side=tk.LEFT, padx=10, pady=8)
+        btn_open.pack(side=tk.LEFT, padx=8, pady=6)
 
-        self.btn_run = tk.Button(
+        btn_synth = tk.Button(
             toolbar,
-            text="⚡ Run Dynamic 50/50 Dual-Engine Analysis",
+            text="🎲 Synthetic Optical Edge",
+            font=("Segoe UI", 10),
+            bg="#2c313a",
+            fg="#d7dae0",
+            relief=tk.FLAT,
+            padx=12,
+            pady=5,
+            command=self._on_generate_synthetic
+        )
+        btn_synth.pack(side=tk.LEFT, padx=5, pady=6)
+
+        btn_detect = tk.Button(
+            toolbar,
+            text="🔍 Auto-Detect Edges",
+            font=("Segoe UI", 10),
+            bg="#2c313a",
+            fg="#00e5ff",
+            relief=tk.FLAT,
+            padx=12,
+            pady=5,
+            command=self._on_auto_detect_edges
+        )
+        btn_detect.pack(side=tk.LEFT, padx=5, pady=6)
+
+        tk.Label(toolbar, text="Target lp/mm:", font=("Segoe UI", 9), fg="#abb2bf", bg="#1c212a").pack(side=tk.LEFT, padx=(20, 5))
+        self.freq_entry = tk.Entry(toolbar, width=6, font=("Segoe UI", 10), bg="#282c34", fg="white", insertbackground="white")
+        self.freq_entry.insert(0, "50.0")
+        self.freq_entry.pack(side=tk.LEFT, padx=2)
+
+        btn_run = tk.Button(
+            toolbar,
+            text="🚀 Run ResNet-Edge Inference",
             font=("Segoe UI", 10, "bold"),
-            bg="#2da44e",
+            bg="#238636",
             fg="white",
             relief=tk.FLAT,
-            padx=15,
+            padx=16,
             pady=5,
-            state=tk.DISABLED,
-            command=self._on_run_analysis
+            command=self._on_run_inference
         )
-        self.btn_run.pack(side=tk.LEFT, padx=10, pady=8)
+        btn_run.pack(side=tk.LEFT, padx=15, pady=6)
 
-        # Overlay Mode Radio Buttons
-        mode_frame = tk.Frame(toolbar, bg="#21252b")
-        mode_frame.pack(side=tk.LEFT, padx=25, pady=8)
-
-        tk.Label(mode_frame, text="Overlay Mode:", font=("Segoe UI", 9, "bold"), fg="#8a99a8", bg="#21252b").pack(side=tk.LEFT, padx=5)
-        
-        self.mode_var = tk.StringVar(value="both")
-        r_both = tk.Radiobutton(mode_frame, text="Dual (Static + Dynamic)", variable=self.mode_var, value="both", fg="#e6edf3", bg="#21252b", selectcolor="#0d1117", activebackground="#21252b", command=self._on_change_overlay_mode)
-        r_both.pack(side=tk.LEFT, padx=5)
-
-        r_dyn = tk.Radiobutton(mode_frame, text="AI Dynamic 50/50 Only", variable=self.mode_var, value="dynamic", fg="#00ffff", bg="#21252b", selectcolor="#0d1117", activebackground="#21252b", command=self._on_change_overlay_mode)
-        r_dyn.pack(side=tk.LEFT, padx=5)
-
-        r_stat = tk.Radiobutton(mode_frame, text="Static Prior Only", variable=self.mode_var, value="static", fg="#ff6b6b", bg="#21252b", selectcolor="#0d1117", activebackground="#21252b", command=self._on_change_overlay_mode)
-        r_stat.pack(side=tk.LEFT, padx=5)
-
-        self.status_badge = tk.Label(
+        btn_export = tk.Button(
             toolbar,
-            text="READY",
-            font=("Segoe UI", 11, "bold"),
-            bg="#30363d",
-            fg="#e6edf3",
-            padx=12,
-            pady=4
+            text="💾 Export CSV",
+            font=("Segoe UI", 9),
+            bg="#2c313a",
+            fg="#abb2bf",
+            relief=tk.FLAT,
+            padx=10,
+            pady=5,
+            command=self._on_export_csv
         )
-        self.status_badge.pack(side=tk.RIGHT, padx=15, pady=8)
+        btn_export.pack(side=tk.RIGHT, padx=10, pady=6)
 
-        # 3. Main Split View
-        main_paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg="#121417", sashwidth=4)
-        main_paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # 3. Main Workspace Split (Left: Image & ROI Selection, Right: 4-Stage Curves & Metrics)
+        main_split = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg="#0f1115", bd=0, sashwidth=4)
+        main_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # Left Column: Image Overlay Display
-        left_frame = tk.Frame(main_paned, bg="#181a1f")
-        main_paned.add(left_frame, minsize=520)
+        # Left Column: Image Canvas & ROI List
+        left_panel = tk.Frame(main_split, bg="#161920", width=520)
+        main_split.add(left_panel, minsize=420)
 
-        img_hdr = tk.Label(
-            left_frame,
-            text="Visual Comparison: Static (Red) vs AI Dynamic 50/50 (Cyan)",
-            font=("Segoe UI", 11, "bold"),
-            fg="#e6edf3",
-            bg="#181a1f"
-        )
-        img_hdr.pack(anchor="w", padx=10, pady=8)
+        img_header = tk.Frame(left_panel, bg="#1c212a")
+        img_header.pack(fill=tk.X, side=tk.TOP)
+        tk.Label(img_header, text="📷 Image View (Click & Drag to Select ROI)", font=("Segoe UI", 10, "bold"), fg="#abb2bf", bg="#1c212a").pack(side=tk.LEFT, padx=10, pady=6)
 
-        self.canvas_img = tk.Canvas(left_frame, bg="#0d1117", highlightthickness=0)
-        self.canvas_img.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.canvas = tk.Canvas(left_panel, bg="#0a0c10", highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.canvas.bind("<ButtonPress-1>", self._on_canvas_press)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
 
-        # Right Column: 4-Panel Physics Pipeline + Detailed Metrics Table
-        right_frame = tk.Frame(main_paned, bg="#181a1f")
-        main_paned.add(right_frame, minsize=780)
+        # Edge List Frame
+        roi_list_frame = tk.Frame(left_panel, bg="#1c212a", height=130)
+        roi_list_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=8, pady=(0, 8))
+        tk.Label(roi_list_frame, text="Detected ROIs:", font=("Segoe UI", 9, "bold"), fg="#abb2bf", bg="#1c212a").pack(anchor=tk.W, padx=8, pady=3)
 
-        # 4-Panel Physics Figure: (2x2 Grid)
-        # Panel 1: Normalized ESF | Panel 2: Windowed LSF
-        # Panel 3: FFT Spectrum  | Panel 4: Normalized MTF Curve
-        fig_frame = tk.Frame(right_frame, bg="#181a1f")
-        fig_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.roi_listbox = tk.Listbox(roi_list_frame, bg="#0f1115", fg="#00e5ff", height=4, selectbackground="#0e639c", selectforeground="white", font=("Segoe UI", 9), bd=0)
+        self.roi_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+        self.roi_listbox.bind("<<ListboxSelect>>", self._on_roi_selected)
 
-        self.fig = Figure(figsize=(7.8, 4.2), dpi=100, facecolor="#181a1f")
-        self.ax_esf = self.fig.add_subplot(221)
-        self.ax_lsf = self.fig.add_subplot(222)
-        self.ax_fft = self.fig.add_subplot(223)
-        self.ax_mtf = self.fig.add_subplot(224)
+        # Right Column: 4-Stage Physics Curves & Metrics Dashboard
+        right_panel = tk.Frame(main_split, bg="#161920")
+        main_split.add(right_panel, minsize=750)
 
-        for ax in (self.ax_esf, self.ax_lsf, self.ax_fft, self.ax_mtf):
+        # Metrics Top Bar
+        metrics_bar = tk.Frame(right_panel, bg="#1c212a", height=70)
+        metrics_bar.pack(fill=tk.X, side=tk.TOP, padx=10, pady=8)
+
+        self.card_neural_mtf = self._create_metric_card(metrics_bar, "2D ResNet-Edge MTF", "-- %", "#00e5ff")
+        self.card_neural_mtf50 = self._create_metric_card(metrics_bar, "Neural MTF50", "-- lp/mm", "#7ee787")
+        self.card_classical_mtf = self._create_metric_card(metrics_bar, "Classical ISO MTF", "-- %", "#ffa657")
+        self.card_latency = self._create_metric_card(metrics_bar, "Inference Latency", "-- ms", "#d2a8ff")
+        self.card_angle = self._create_metric_card(metrics_bar, "Edge Slant Angle", "-- °", "#79c0ff")
+
+        # 4-Stage Physics Matplotlib Canvas
+        curves_frame = tk.Frame(right_panel, bg="#161920")
+        curves_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        self.fig = Figure(figsize=(10, 7), dpi=100, facecolor="#161920")
+        self.fig.subplots_adjust(left=0.08, right=0.96, top=0.92, bottom=0.10, hspace=0.38, wspace=0.28)
+
+        self.ax_esf = self.fig.add_subplot(2, 2, 1)
+        self.ax_lsf = self.fig.add_subplot(2, 2, 2)
+        self.ax_fft = self.fig.add_subplot(2, 2, 3)
+        self.ax_mtf = self.fig.add_subplot(2, 2, 4)
+
+        for ax, title in zip(
+            [self.ax_esf, self.ax_lsf, self.ax_fft, self.ax_mtf],
+            ["Stage 1: Normalized ESF", "Stage 2: LSF Bell Curve", "Stage 3: FFT Spectrum", "Stage 4: 2D ResNet-Edge MTF Curve"]
+        ):
             ax.set_facecolor("#0d1117")
-            ax.tick_params(colors="#8a99a8", labelsize=8)
+            ax.set_title(title, fontsize=10, fontweight="bold", color="#d7dae0")
+            ax.tick_params(colors="#8b949e", labelsize=8)
             ax.grid(True, linestyle="--", alpha=0.3, color="#30363d")
 
-        self.ax_esf.set_title("1. Normalized ESF (50/50 Symmetric)", color="#e6edf3", fontsize=9, fontweight="bold")
-        self.ax_lsf.set_title("2. Line Spread Function (LSF Derivative)", color="#e6edf3", fontsize=9, fontweight="bold")
-        self.ax_fft.set_title("3. FFT Magnitude Spectrum", color="#e6edf3", fontsize=9, fontweight="bold")
-        self.ax_mtf.set_title("4. Final Normalized MTF (0% - 100%)", color="#e6edf3", fontsize=9, fontweight="bold")
+        self.plot_canvas = FigureCanvasTkAgg(self.fig, master=curves_frame)
+        self.plot_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        self.fig.tight_layout()
+    def _create_metric_card(self, parent, title, value, fg_color):
+        frame = tk.Frame(parent, bg="#0d1117", padx=14, pady=6, highlightbackground="#30363d", highlightthickness=1)
+        frame.pack(side=tk.LEFT, padx=6, pady=6, fill=tk.BOTH, expand=True)
 
-        self.canvas_fig = FigureCanvasTkAgg(self.fig, master=fig_frame)
-        self.canvas_fig.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        t_lbl = tk.Label(frame, text=title, font=("Segoe UI", 8), fg="#8b949e", bg="#0d1117")
+        t_lbl.pack(anchor=tk.W)
 
-        # Results Table
-        table_frame = tk.Frame(right_frame, bg="#181a1f")
-        table_frame.pack(fill=tk.X, padx=10, pady=10)
+        v_lbl = tk.Label(frame, text=value, font=("Segoe UI", 13, "bold"), fg=fg_color, bg="#0d1117")
+        v_lbl.pack(anchor=tk.W, pady=(2, 0))
+        return v_lbl
 
-        columns = ("ROI", "Static Bal", "AI 50/50", "Static MTF", "Dynamic MTF", "PINN Neural", "Shift", "Consensus")
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=6)
-        widths = (75, 95, 95, 85, 95, 95, 65, 110)
-        for col, w in zip(columns, widths):
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=w, anchor="center")
-        self.tree.pack(fill=tk.X)
+    def _load_default_synthetic_sample(self):
+        """Loads a clean synthetic slanted edge by default so the app displays immediately."""
+        roi, freqs, gt_mtf = generate_slanted_edge(width=50, height=50, angle_deg=6.0, blur_sigma=1.2)
+        self.current_image = roi
+        self.current_image_gray = roi
+        self.selected_roi_crop = roi
+        self._display_image_on_canvas(roi)
+        self._on_run_inference()
 
-        self.tree.bind("<<TreeviewSelect>>", self._on_select_roi_row)
-
-    def _on_select_image(self):
-        f = filedialog.askopenfilename(
-            title="Select Camera Test Image",
-            filetypes=[("Image Files", "*.png *.bmp *.jpg *.jpeg *.tif")]
-        )
-        if f:
-            self.current_image_path = f
-            self.current_image_gray = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
-            self.btn_run.config(state=tk.NORMAL)
-            self._display_image(f)
-
-    def _display_image(self, path_or_mat):
-        if isinstance(path_or_mat, str):
-            mat = cv2.imread(path_or_mat)
+    def _display_image_on_canvas(self, img_array):
+        if img_array is None:
+            return
+        if img_array.ndim == 2:
+            img_bgr = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
         else:
-            mat = path_or_mat
+            img_bgr = img_array.copy()
 
-        if mat is None:
-            return
+        # Scale to fit canvas
+        canvas_w = max(100, self.canvas.winfo_width() or 480)
+        canvas_h = max(100, self.canvas.winfo_height() or 400)
+        h, w = img_bgr.shape[:2]
 
-        h, w = mat.shape[:2]
-        cw = self.canvas_img.winfo_width() or 520
-        ch = self.canvas_img.winfo_height() or 520
+        self.scale_factor = min(canvas_w / w, canvas_h / h, 2.0)
+        disp_w = max(1, int(w * self.scale_factor))
+        disp_h = max(1, int(h * self.scale_factor))
 
-        scale = min(cw / w, ch / h, 1.0)
-        new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
-        resized = cv2.resize(mat, (new_w, new_h))
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB) if resized.ndim == 3 else cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB)
-        im_pil = Image.fromarray(rgb)
-        self.tk_img = ImageTk.PhotoImage(im_pil)
+        resized = cv2.resize(img_bgr, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+        img_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
+        self.display_image = ImageTk.PhotoImage(pil_img)
 
-        self.canvas_img.delete("all")
-        self.canvas_img.create_image(cw // 2, ch // 2, anchor=tk.CENTER, image=self.tk_img)
+        self.canvas.delete("all")
+        self.canvas.create_image(canvas_w // 2, canvas_h // 2, image=self.display_image, anchor=tk.CENTER)
+        self.img_offset_x = (canvas_w - disp_w) // 2
+        self.img_offset_y = (canvas_h - disp_h) // 2
 
-    def _on_run_analysis(self):
-        if not self.current_image_path:
-            return
-
-        self.status_badge.config(text="ANALYZING...", bg="#0e639c")
-        threading.Thread(target=self._run_bg_analysis, daemon=True).start()
-
-    def _run_bg_analysis(self):
-        try:
-            res = process_full_image_static_vs_dynamic(self.current_image_path)
-            # Add PINN neural evaluations
-            for sec, comp in res["comparisons"].items():
-                if comp.get("dynamic_crop") is not None:
-                    neural_res = self.neural_engine.predict_neural_mtf(comp["dynamic_crop"], target_freq_lpmm=50.0)
-                    comp["neural_res"] = neural_res
-            self.current_results = res
-            self.after(0, self._render_results)
-        except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Analysis Error", str(e)))
-
-    def _render_results(self):
-        if not self.current_results:
-            return
-
-        res = self.current_results
-        self._update_overlay_display()
-
-        # Update Badge
-        self.status_badge.config(text="50/50 OPTIMAL", bg="#2da44e")
-
-        # Populate Table
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-
-        for sec, comp in res["comparisons"].items():
-            s_b = comp["static_balance"]
-            d_b = comp["dynamic_balance"]
-            s_m = comp["static_mtf"]["MTFPercent"] if comp["static_mtf"] else 0.0
-            d_m = comp["dynamic_mtf"]["MTFPercent"] if comp["dynamic_mtf"] else 0.0
-            n_res = comp.get("neural_res")
-            n_m = n_res["NeuralMTFPercent"] if n_res else d_m
-            sh = comp["correction_shift_px"]
-
-            delta = abs(d_m - n_m)
-            consensus = "CONSENSUS_PASS" if delta <= 6.0 else "ANOMALY_WARNING"
-
-            self.tree.insert("", tk.END, values=(
-                sec,
-                f"{s_b['dark_pct']:.0f}/{s_b['bright_pct']:.0f}%",
-                f"{d_b['dark_pct']:.0f}/{d_b['bright_pct']:.0f}%",
-                f"{min(100.0, s_m):.2f}%",
-                f"{min(100.0, d_m):.2f}%",
-                f"{min(100.0, n_m):.2f}%",
-                f"{sh:.1f} px",
-                consensus
-            ))
-
-        # Select and plot first ROI
-        if self.tree.get_children():
-            first_item = self.tree.get_children()[0]
-            self.tree.selection_set(first_item)
-            self._plot_roi_physics_pipeline(self.tree.item(first_item)["values"][0])
-
-    def _on_change_overlay_mode(self):
-        self.overlay_mode = self.mode_var.get()
-        if self.current_results and self.current_image_gray is not None:
-            self._update_overlay_display()
-
-    def _update_overlay_display(self):
-        if not self.current_results or self.current_image_gray is None:
-            return
-        overlay_mat = generate_dual_overlay_image(
-            self.current_image_gray,
-            self.current_results["comparisons"],
-            mode=self.overlay_mode
+    def _on_open_image(self):
+        path = filedialog.askopenfilename(
+            title="Select Camera Image or Edge Patch",
+            filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff"), ("All Files", "*.*")]
         )
-        self._display_image(overlay_mat)
-
-    def _on_select_roi_row(self, event):
-        sel = self.tree.selection()
-        if sel:
-            sec_name = self.tree.item(sel[0])["values"][0]
-            self._plot_roi_physics_pipeline(sec_name)
-
-    def _plot_roi_physics_pipeline(self, sec_name):
-        if not self.current_results:
+        if not path:
             return
-        comp = self.current_results["comparisons"].get(sec_name)
-        if not comp:
+        img = cv2.imread(path)
+        if img is None:
+            messagebox.showerror("Error", f"Could not load image: {path}")
+            return
+        self.current_image = img
+        self.current_image_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        self.selected_roi_crop = self.current_image_gray
+        self.detected_rois = []
+        self.roi_listbox.delete(0, tk.END)
+
+        self._display_image_on_canvas(img)
+
+        # If it's a small crop, run inference immediately. Otherwise auto-detect.
+        h, w = self.current_image_gray.shape
+        if w <= 120 and h <= 120:
+            self._on_run_inference()
+        else:
+            self._on_auto_detect_edges()
+
+    def _on_generate_synthetic(self):
+        angle = np.random.uniform(4.0, 8.0)
+        sigma = np.random.uniform(0.6, 2.5)
+        noise = np.random.uniform(0.5, 3.0)
+        roi, _, _ = generate_slanted_edge(width=60, height=60, angle_deg=angle, blur_sigma=sigma, noise_sigma=noise)
+        self.current_image = roi
+        self.current_image_gray = roi
+        self.selected_roi_crop = roi
+        self.detected_rois = []
+        self.roi_listbox.delete(0, tk.END)
+        self._display_image_on_canvas(roi)
+        self._on_run_inference()
+
+    def _on_auto_detect_edges(self):
+        if self.current_image_gray is None:
+            return
+        rois = self.engine.auto_detect_slanted_edges(self.current_image_gray, max_edges=8)
+        self.detected_rois = rois
+        self.roi_listbox.delete(0, tk.END)
+        for name, x1, y1, x2, y2 in rois:
+            self.roi_listbox.insert(tk.END, f"{name}: [{x1},{y1} to {x2},{y2}]")
+
+        if rois:
+            self.roi_listbox.selection_set(0)
+            self._on_roi_selected(None)
+
+    def _on_roi_selected(self, event):
+        sel = self.roi_listbox.curselection()
+        if not sel or not self.detected_rois:
+            return
+        idx = sel[0]
+        name, x1, y1, x2, y2 = self.detected_rois[idx]
+        self.selected_roi_crop = self.current_image_gray[y1:y2, x1:x2]
+        self._draw_roi_rect(x1, y1, x2, y2)
+        self._on_run_inference()
+
+    def _draw_roi_rect(self, x1, y1, x2, y2):
+        if not hasattr(self, "img_offset_x"):
+            return
+        sx1 = self.img_offset_x + int(x1 * self.scale_factor)
+        sy1 = self.img_offset_y + int(y1 * self.scale_factor)
+        sx2 = self.img_offset_x + int(x2 * self.scale_factor)
+        sy2 = self.img_offset_y + int(y2 * self.scale_factor)
+
+        self.canvas.delete("roi_box")
+        self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline="#00e5ff", width=2, tags="roi_box")
+
+    def _on_canvas_press(self, event):
+        self.drag_start = (event.x, event.y)
+
+    def _on_canvas_drag(self, event):
+        if not self.drag_start:
+            return
+        self.canvas.delete("drag_box")
+        x0, y0 = self.drag_start
+        self.canvas.create_rectangle(x0, y0, event.x, event.y, outline="#7ee787", width=1, dash=(3, 3), tags="drag_box")
+
+    def _on_canvas_release(self, event):
+        if not self.drag_start or self.current_image_gray is None:
+            return
+        x0, y0 = self.drag_start
+        x1, y1 = event.x, event.y
+        self.drag_start = None
+        self.canvas.delete("drag_box")
+
+        # Map canvas coordinates back to image pixel coordinates
+        if not hasattr(self, "img_offset_x"):
+            return
+        ix1 = int((min(x0, x1) - self.img_offset_x) / self.scale_factor)
+        iy1 = int((min(y0, y1) - self.img_offset_y) / self.scale_factor)
+        ix2 = int((max(x0, x1) - self.img_offset_x) / self.scale_factor)
+        iy2 = int((max(y0, y1) - self.img_offset_y) / self.scale_factor)
+
+        h, w = self.current_image_gray.shape
+        ix1, iy1 = max(0, ix1), max(0, iy1)
+        ix2, iy2 = min(w, ix2), min(h, iy2)
+
+        if ix2 - ix1 >= 15 and iy2 - iy1 >= 15:
+            self.selected_roi_crop = self.current_image_gray[iy1:iy2, ix1:ix2]
+            self._draw_roi_rect(ix1, iy1, ix2, iy2)
+            self._on_run_inference()
+
+    def _on_run_inference(self):
+        crop = self.selected_roi_crop if self.selected_roi_crop is not None else self.current_image_gray
+        if crop is None or crop.size < 32:
             return
 
-        s_mtf = comp["static_mtf"]
-        d_mtf = comp["dynamic_mtf"]
-        n_res = comp.get("neural_res")
+        try:
+            target_f = float(self.freq_entry.get().strip())
+        except ValueError:
+            target_f = 50.0
 
-        # Clear all 4 subplots
-        for ax in (self.ax_esf, self.ax_lsf, self.ax_fft, self.ax_mtf):
-            ax.clear()
+        res = self.engine.analyze_roi_full(crop, target_freq_lpmm=target_f, pixel_size_mm=self.pixel_size_mm)
+        self.current_results = res
+        self._update_ui_with_results(res)
+
+    def _update_ui_with_results(self, res):
+        if res is None:
+            return
+
+        neural = res.get("neural")
+        classical = res.get("classical")
+
+        # 1. Update Metrics Cards
+        if neural:
+            self.card_neural_mtf.config(text=f"{neural['NeuralMTFPercent']:.2f} %")
+            self.card_neural_mtf50.config(text=f"{neural['NeuralMTF50']:.1f} lp/mm")
+            self.card_latency.config(text=f"{neural['InferenceTimeMs']:.3f} ms")
+        else:
+            self.card_neural_mtf.config(text="-- %")
+
+        if classical and classical.get("FilteredMTF") is not None:
+            c_val = classical["FilteredMTF"] * 100.0
+            self.card_classical_mtf.config(text=f"{c_val:.2f} %")
+            if "EdgeAngleDeg" in classical:
+                self.card_angle.config(text=f"{classical['EdgeAngleDeg']:.1f} °")
+        else:
+            self.card_classical_mtf.config(text="-- %")
+
+        # 2. Update 4-Stage Curves Plot
+        for ax in [self.ax_esf, self.ax_lsf, self.ax_fft, self.ax_mtf]:
+            ax.cla()
             ax.set_facecolor("#0d1117")
-            ax.tick_params(colors="#8a99a8", labelsize=8)
+            ax.tick_params(colors="#8b949e", labelsize=8)
             ax.grid(True, linestyle="--", alpha=0.3, color="#30363d")
 
-        # ---------------------------------------------------------
-        # 1. Panel 1: Normalized ESF (0.0 to 1.0)
-        # ---------------------------------------------------------
-        if s_mtf and "NormalizedESF" in s_mtf:
-            self.ax_esf.plot(s_mtf["NormalizedESF"], color="#ff4444", linestyle="--", label="Static ESF (Off-Center)", alpha=0.8)
-        if d_mtf and "NormalizedESF" in d_mtf:
-            self.ax_esf.plot(d_mtf["NormalizedESF"], color="#00ffff", linewidth=2.0, label="Dynamic 50/50 ESF")
-        self.ax_esf.set_title(f"1. Normalized ESF (ROI '{sec_name}')", color="#e6edf3", fontsize=9, fontweight="bold")
-        self.ax_esf.set_xlabel("Super-Sampled Bins (0.25 px)", color="#8a99a8", fontsize=8)
-        self.ax_esf.set_ylabel("Norm. Intensity (0 - 1)", color="#8a99a8", fontsize=8)
-        self.ax_esf.set_ylim(-0.05, 1.05)
-        self.ax_esf.legend(facecolor="#181a1f", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=7.5)
+        # Panel 1: ESF
+        self.ax_esf.set_title("Stage 1: Normalized ESF", fontsize=9, fontweight="bold", color="#d7dae0")
+        if classical and "NormalizedESF" in classical:
+            esf = classical["NormalizedESF"]
+            self.ax_esf.plot(esf, color="#58a6ff", linewidth=1.8, label="ESF")
+            self.ax_esf.set_ylim(-0.05, 1.05)
+            self.ax_esf.set_ylabel("Normalized Intensity", color="#8b949e", fontsize=7)
 
-        # ---------------------------------------------------------
-        # 2. Panel 2: Line Spread Function (LSF Derivative)
-        # ---------------------------------------------------------
-        if s_mtf and "NormalizedLSF" in s_mtf:
-            self.ax_lsf.plot(s_mtf["NormalizedLSF"], color="#ff4444", linestyle="--", label="Static LSF", alpha=0.8)
-        if d_mtf and "NormalizedLSF" in d_mtf:
-            self.ax_lsf.plot(d_mtf["NormalizedLSF"], color="#00ffff", linewidth=2.0, label="Dynamic 50/50 LSF")
-        self.ax_lsf.set_title("2. Line Spread Function (LSF Bell Curve)", color="#e6edf3", fontsize=9, fontweight="bold")
-        self.ax_lsf.set_xlabel("Subpixel Spatial Distance", color="#8a99a8", fontsize=8)
-        self.ax_lsf.set_ylabel("Amplitude (0 to 1)", color="#8a99a8", fontsize=8)
-        self.ax_lsf.set_ylim(-0.05, 1.05)
-        self.ax_lsf.legend(facecolor="#181a1f", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=7.5)
+        # Panel 2: LSF (Gaussian bell curve)
+        self.ax_lsf.set_title("Stage 2: LSF Bell Curve (Hann Windowed)", fontsize=9, fontweight="bold", color="#d7dae0")
+        if classical and "LSFBellCurve" in classical:
+            lsf = classical["LSFBellCurve"]
+            self.ax_lsf.plot(lsf, color="#7ee787", linewidth=2.0, label="LSF")
+            self.ax_lsf.set_ylim(-0.05, max(1.1, np.max(lsf) * 1.1))
+            self.ax_lsf.set_ylabel("Line Spread Amplitude", color="#8b949e", fontsize=7)
 
-        # ---------------------------------------------------------
-        # 3. Panel 3: FFT Magnitude Spectrum
-        # ---------------------------------------------------------
-        if d_mtf and "FFTSpectrum" in d_mtf:
-            fft_v = d_mtf["FFTSpectrum"]
-            n_show = min(64, len(fft_v))
-            self.ax_fft.plot(fft_v[:n_show], color="#a371f7", linewidth=2.0, label="|FFT(LSF)| (DC=1.0)")
-        self.ax_fft.set_title("3. Smooth FFT Magnitude Spectrum", color="#e6edf3", fontsize=9, fontweight="bold")
-        self.ax_fft.set_xlabel("FFT Frequency Bins", color="#8a99a8", fontsize=8)
-        self.ax_fft.set_ylabel("Magnitude (DC=1.0)", color="#8a99a8", fontsize=8)
-        self.ax_fft.set_ylim(0, 1.05)
-        self.ax_fft.legend(facecolor="#181a1f", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=7.5)
+        # Panel 3: FFT
+        self.ax_fft.set_title("Stage 3: FFT Spectrum", fontsize=9, fontweight="bold", color="#d7dae0")
+        if classical and "FFTSpectrum" in classical:
+            fft_mag = classical["FFTSpectrum"]
+            freqs = classical.get("Frequencies", np.linspace(0, 100, len(fft_mag)))
+            mask = freqs <= 100.0
+            self.ax_fft.plot(freqs[mask], fft_mag[mask], color="#d2a8ff", linewidth=1.8)
+            self.ax_fft.set_ylim(-0.05, 1.05)
+            self.ax_fft.set_xlabel("Spatial Frequency (lp/mm)", color="#8b949e", fontsize=7)
 
-        # ---------------------------------------------------------
-        # 4. Panel 4: Final Normalized MTF Curve (0% - 100%)
-        # ---------------------------------------------------------
-        if s_mtf:
-            f_s = s_mtf["Frequencies"]
-            m_s = np.clip(s_mtf["MTFCurve"], 0.0, 1.0)
-            mask_s = f_s <= 100.0
-            self.ax_mtf.plot(f_s[mask_s], m_s[mask_s], color="#ff4444", linestyle="--", label=f"Static MTF: {min(100.0, s_mtf['MTFPercent']):.1f}%", alpha=0.8)
+        # Panel 4: 2D ResNet-Edge Neural MTF vs Classical ISO 12233
+        self.ax_mtf.set_title("Stage 4: 2D ResNet-Edge MTF Curve", fontsize=9, fontweight="bold", color="#d7dae0")
+        if neural:
+            f_n = neural["Frequencies"]
+            m_n = neural["NeuralMTFCurve"]
+            self.ax_mtf.plot(f_n, m_n * 100.0, color="#00e5ff", linewidth=2.4, label="2D ResNet-Edge (Neural)")
 
-        if d_mtf:
-            f_d = d_mtf["Frequencies"]
-            m_d = np.clip(d_mtf["MTFCurve"], 0.0, 1.0)
-            mask_d = f_d <= 100.0
-            self.ax_mtf.plot(f_d[mask_d], m_d[mask_d], color="#00ffff", linewidth=2.2, label=f"AI Dynamic: {min(100.0, d_mtf['MTFPercent']):.1f}%")
+        if classical and "MTFCurve" in classical:
+            f_c = classical["Frequencies"]
+            m_c = classical["MTFCurve"]
+            mask_c = f_c <= 100.0
+            self.ax_mtf.plot(f_c[mask_c], m_c[mask_c] * 100.0, color="#ffa657", linestyle="--", linewidth=1.8, label="ISO 12233 Reference")
 
-        if n_res:
-            f_n = n_res["Frequencies"]
-            m_n = np.clip(n_res["NeuralMTFCurve"], 0.0, 1.0)
-            mask_n = f_n <= 100.0
-            self.ax_mtf.plot(f_n[mask_n], m_n[mask_n], color="#f0883e", linewidth=1.8, linestyle=":", label=f"PINN Neural: {min(100.0, n_res['NeuralMTFPercent']):.1f}%")
+        target_f = res.get("target_freq_lpmm", 50.0)
+        if neural:
+            self.ax_mtf.axvline(x=target_f, color="#ff7b72", linestyle=":", alpha=0.7, label=f"Target: {target_f} lp/mm")
+            self.ax_mtf.scatter([target_f], [neural["NeuralMTFPercent"]], color="#00e5ff", s=40, zorder=5)
 
-        self.ax_mtf.axvline(x=50.0, color="#8a99a8", linestyle=":", label="50 lp/mm")
-        self.ax_mtf.set_title("4. Normalized MTF Curve (0% - 100%)", color="#e6edf3", fontsize=9, fontweight="bold")
-        self.ax_mtf.set_xlabel("Spatial Frequency (lp/mm)", color="#8a99a8", fontsize=8)
-        self.ax_mtf.set_ylabel("MTF (0.0 to 1.0)", color="#8a99a8", fontsize=8)
-        self.ax_mtf.set_ylim(0, 1.05)
+        self.ax_mtf.set_ylim(-2.0, 102.0)
         self.ax_mtf.set_xlim(0, 100)
-        self.ax_mtf.legend(facecolor="#181a1f", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=7.5)
+        self.ax_mtf.set_xlabel("Spatial Frequency (lp/mm)", color="#8b949e", fontsize=7)
+        self.ax_mtf.set_ylabel("MTF (%)", color="#8b949e", fontsize=7)
+        self.ax_mtf.legend(loc="upper right", fontsize=7, facecolor="#161920", edgecolor="#30363d", labelcolor="#c9d1d9")
 
-        self.fig.tight_layout()
-        self.canvas_fig.draw()
+        self.plot_canvas.draw_idle()
+
+    def _on_export_csv(self):
+        if not self.current_results or not self.current_results.get("neural"):
+            messagebox.showwarning("Warning", "No active MTF results to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV File", "*.csv")],
+            title="Save MTF Curve Data"
+        )
+        if not path:
+            return
+        try:
+            neural = self.current_results["neural"]
+            freqs = neural["Frequencies"]
+            curves = neural["NeuralMTFCurve"]
+            with open(path, "w") as f:
+                f.write("Frequency_lpmm,Neural_MTF,Neural_MTF_Percent\n")
+                for fq, val in zip(freqs, curves):
+                    f.write(f"{fq:.2f},{val:.6f},{val*100.0:.2f}\n")
+            messagebox.showinfo("Success", f"Exported MTF data to {path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export CSV: {e}")
+
+
+def main():
+    app = ModernMTFApp()
+    app.mainloop()
 
 
 if __name__ == "__main__":
-    app = DualEngineApp()
-    app.mainloop()
+    main()
